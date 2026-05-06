@@ -1,0 +1,131 @@
+# =========================
+# OS / System
+# =========================
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# =========================
+# Python
+# =========================
+pycache/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Type checkers / linters
+.mypy_cache/
+.pyre/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# =========================
+# ML / Data
+# =========================
+ml/artifacts/
+*.pkl
+*.joblib
+*.h5
+*.onnx
+*.parquet
+*.feather
+*.csv
+*.zip
+*.tar.gz
+
+# Large data folders
+data/
+datasets/
+raw_data/
+
+# =========================
+# Logs
+# =========================
+.log
+logs/
+
+# =========================
+# Environment variables
+# =========================
+.env
+.env.
+!.env.example
+
+# =========================
+# Node / Next.js (frontend)
+# =========================
+node_modules/
+.next/
+out/
+dist/
+
+# Build artifacts
+*.tsbuildinfo
+
+# =========================
+# AWS / Cloud
+# =========================
+.aws/
+*.pem
+*.key
+
+# Terraform (if you add later)
+.terraform/
+*.tfstate
+.tfstate.
+
+# =========================
+# Docker
+# =========================
+*.dockerignore
+docker-compose.override.yml
+
+# =========================
+# IDE / Editor
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# Misc
+# =========================
+*.bak
+*.tmp
+.cache
+
+# =========================
+# Project-specific (important)
+# =========================
+# Ignore local storage implementations if needed
+infrastructure/storage/.db
+
+# Ignore generated pipelines output
+pipelines/output/
+pipelines/tmp/
+
+# Backtesting outputs
+backtesting/results/
+backtesting/tmp/

@@ -1,0 +1,1 @@
+"""Infrastructure-level config placeholder."""
