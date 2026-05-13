@@ -1,29 +1,37 @@
 """
 Feature engineering pipeline for the Energy Decision Engine.
 
-Transforms validated, normalised records from the ingestion layer into
-model-ready feature vectors suitable for imbalance and price forecasting.
+Transforms validated, normalised market intervals into model-ready
+feature vectors for imbalance and price forecasting.
 
 Design principles:
-- All transformations are stateless and deterministic given the same input.
-- Features are grouped by family (lag, ramp, temporal, rolling, calendar)
-  so they can be enabled/disabled independently per model.
-- No silent NaN propagation: every transformation documents its null
-  behaviour and the pipeline surface missing values explicitly.
-- Holiday calendars for both ROI and NI are handled from a single entry
-  point so market-boundary differences never leak into model code.
-- Output is a FeatureFrame: a lightweight typed container that carries
-  both the feature matrix and a feature manifest for auditability.
+- All transformations operate on a single pandas DataFrame internally;
+  the public API accepts and returns typed domain objects so the pandas
+  dependency stays an implementation detail.
+- Features are computed in vectorised operations only — no row-wise
+  apply() or Python-level loops over rows.
+- NaN propagation is explicit: every feature documents its null
+  behaviour.  The pipeline never silently fills or drops NaNs without
+  a caller-visible flag.
+- Holiday calendars for ROI and NI are handled from a single entry
+  point; market-boundary differences never leak into model code.
+- The FeatureManifest is derived from config before any data is
+  processed, so feature definitions are always reproducible.
+- All timestamps are UTC throughout; Europe/Dublin conversion is an
+  operational concern at system edges only.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
-import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from typing import Sequence
+
+import numpy as np
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -41,16 +49,16 @@ class FeatureFamily(str, Enum):
 
 
 # ---------------------------------------------------------------------------
-# Core data containers
+# Domain containers (public API — no pandas exposure)
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class IntervalRecord:
     """
-    One normalised market interval as produced by the ingestion layer.
+    One normalised market interval from the ingestion layer.
 
-    All values use explicit units in the field name.
-    Missing optional values are represented as None, never as sentinels.
+    All values carry explicit units in the field name.
+    None represents a genuinely missing observation, never a sentinel.
     """
 
     timestamp_utc: datetime
@@ -67,12 +75,7 @@ class IntervalRecord:
 
 @dataclass
 class FeatureVector:
-    """
-    All engineered features for a single interval.
-
-    Features absent due to insufficient history are stored as None.
-    The consumer (model training / inference) decides how to handle them.
-    """
+    """Engineered features for a single interval."""
 
     timestamp_utc: datetime
     features: dict[str, float | None]
@@ -84,12 +87,7 @@ class FeatureVector:
 
 @dataclass
 class FeatureManifest:
-    """
-    Audit record describing every feature in the output.
-
-    Stored alongside training datasets so feature definitions are
-    always reproducible.
-    """
+    """Audit record for one feature column."""
 
     feature_name: str
     family: FeatureFamily
@@ -101,10 +99,10 @@ class FeatureManifest:
 @dataclass
 class FeatureFrame:
     """
-    Container returned by the pipeline: feature vectors + manifest.
+    Pipeline output: feature vectors plus the manifest that describes them.
 
-    The manifest lists every feature that was attempted; the vectors
-    contain the computed values (None where unavailable).
+    The manifest is generated from config before any records are
+    processed, so it is available for schema validation downstream.
     """
 
     vectors: list[FeatureVector]
@@ -131,63 +129,11 @@ class FeatureFrame:
 
 
 # ---------------------------------------------------------------------------
-# Holiday calendars — ROI and NI kept separate
+# Holiday calendars
 # ---------------------------------------------------------------------------
 
-def _roi_public_holidays(year: int) -> frozenset[date]:
-    """
-    Republic of Ireland public holidays for a given year.
-
-    Fixed-date and rule-based holidays only.  Easter-dependent holidays
-    use the anonymous Gregorian algorithm (no external dependency).
-    """
-    easter = _easter_sunday(year)
-    return frozenset({
-        date(year, 1, 1),                        # New Year's Day
-        date(year, 2, 3) if date(year, 2, 3).weekday() == 0  # St Brigid's (first Mon Feb)
-            else _first_monday_in_month(year, 2),
-        easter - timedelta(days=2),              # Good Friday (not statutory but observed)
-        easter,                                  # Easter Sunday
-        easter + timedelta(days=1),              # Easter Monday
-        _first_monday_in_month(year, 5),         # May Bank Holiday
-        _first_monday_in_month(year, 6),         # June Bank Holiday
-        _first_monday_in_month(year, 8),         # August Bank Holiday
-        _last_monday_in_month(year, 10),         # October Bank Holiday
-        date(year, 12, 25),                      # Christmas Day
-        date(year, 12, 26),                      # St Stephen's Day
-    })
-
-
-def _ni_public_holidays(year: int) -> frozenset[date]:
-    """
-    Northern Ireland public holidays for a given year.
-
-    NI follows the UK bank holiday schedule with two NI-specific additions:
-    St Patrick's Day and the Battle of the Boyne.
-    """
-    easter = _easter_sunday(year)
-    may_day = _first_monday_in_month(year, 5)
-    # UK Spring Bank Holiday: last Monday in May
-    spring_bh = _last_monday_in_month(year, 5)
-    # UK Summer Bank Holiday: last Monday in August
-    summer_bh = _last_monday_in_month(year, 8)
-
-    return frozenset({
-        date(year, 1, 1),                        # New Year's Day
-        date(year, 3, 17),                       # St Patrick's Day (NI only)
-        easter - timedelta(days=2),              # Good Friday
-        easter + timedelta(days=1),              # Easter Monday
-        may_day,                                 # Early May Bank Holiday
-        spring_bh,                               # Spring Bank Holiday
-        date(year, 7, 12),                       # Battle of the Boyne (NI only)
-        summer_bh,                               # Summer Bank Holiday
-        date(year, 12, 25),                      # Christmas Day
-        date(year, 12, 26),                      # Boxing Day
-    })
-
-
 def _easter_sunday(year: int) -> date:
-    """Anonymous Gregorian algorithm for Easter Sunday."""
+    """Anonymous Gregorian algorithm — no external dependency."""
     a = year % 19
     b, c = divmod(year, 100)
     d, e = divmod(b, 4)
@@ -201,51 +147,108 @@ def _easter_sunday(year: int) -> date:
     return date(year, month, day + 1)
 
 
-def _first_monday_in_month(year: int, month: int) -> date:
+def _first_monday(year: int, month: int) -> date:
     d = date(year, month, 1)
     return d + timedelta(days=(7 - d.weekday()) % 7)
 
 
-def _last_monday_in_month(year: int, month: int) -> date:
-    # Find the last day of the month then walk back to Monday.
-    if month == 12:
-        last = date(year + 1, 1, 1) - timedelta(days=1)
-    else:
-        last = date(year, month + 1, 1) - timedelta(days=1)
-    return last - timedelta(days=(last.weekday() - 0) % 7)
+def _last_monday(year: int, month: int) -> date:
+    last = (
+        date(year + 1, 1, 1) - timedelta(days=1)
+        if month == 12
+        else date(year, month + 1, 1) - timedelta(days=1)
+    )
+    return last - timedelta(days=(last.weekday()) % 7)
 
 
-@dataclass(frozen=True)
+def _roi_holidays(year: int) -> frozenset[date]:
+    easter = _easter_sunday(year)
+    return frozenset({
+        date(year, 1, 1),
+        _first_monday(year, 2),                     # St Brigid's Day
+        easter - timedelta(days=2),                 # Good Friday
+        easter,
+        easter + timedelta(days=1),                 # Easter Monday
+        _first_monday(year, 5),                     # May Bank Holiday
+        _first_monday(year, 6),                     # June Bank Holiday
+        _first_monday(year, 8),                     # August Bank Holiday
+        _last_monday(year, 10),                     # October Bank Holiday
+        date(year, 12, 25),
+        date(year, 12, 26),                         # St Stephen's Day
+    })
+
+
+def _ni_holidays(year: int) -> frozenset[date]:
+    easter = _easter_sunday(year)
+    return frozenset({
+        date(year, 1, 1),
+        date(year, 3, 17),                          # St Patrick's Day
+        easter - timedelta(days=2),                 # Good Friday
+        easter + timedelta(days=1),                 # Easter Monday
+        _first_monday(year, 5),                     # Early May Bank Holiday
+        _last_monday(year, 5),                      # Spring Bank Holiday
+        date(year, 7, 12),                          # Battle of the Boyne
+        _last_monday(year, 8),                      # Summer Bank Holiday
+        date(year, 12, 25),
+        date(year, 12, 26),                         # Boxing Day
+    })
+
+
+@dataclass
 class AllIslandCalendar:
     """
-    Combined ROI + NI calendar.
+    Combined ROI + NI public holiday calendar with per-year caching.
 
-    Exposes per-jurisdiction flags so models can treat them independently
-    or together depending on the participant's grid connection.
+    Separate flags are preserved so models can treat jurisdictions
+    independently for participants whose grid connection differs.
     """
 
     _cache: dict[int, tuple[frozenset[date], frozenset[date]]] = field(
-        default_factory=dict, compare=False, repr=False
+        default_factory=dict, init=False, repr=False
     )
 
-    def _holidays(self, year: int) -> tuple[frozenset[date], frozenset[date]]:
+    def _get(self, year: int) -> tuple[frozenset[date], frozenset[date]]:
         if year not in self._cache:
-            self._cache[year] = (
-                _roi_public_holidays(year),
-                _ni_public_holidays(year),
-            )
+            self._cache[year] = (_roi_holidays(year), _ni_holidays(year))
         return self._cache[year]
 
     def is_roi_holiday(self, d: date) -> bool:
-        roi, _ = self._holidays(d.year)
+        roi, _ = self._get(d.year)
         return d in roi
 
     def is_ni_holiday(self, d: date) -> bool:
-        _, ni = self._holidays(d.year)
+        _, ni = self._get(d.year)
         return d in ni
 
-    def is_any_holiday(self, d: date) -> bool:
-        return self.is_roi_holiday(d) or self.is_ni_holiday(d)
+    def build_holiday_frame(self, index: pd.DatetimeIndex) -> pd.DataFrame:
+        """
+        Vectorised holiday flag construction for a full DatetimeIndex.
+
+        Iterates once over the unique dates in the index rather than
+        once per row, so cost scales with unique calendar days not rows.
+        """
+        unique_dates = {ts.date() for ts in index}
+        roi_set: set[date] = set()
+        ni_set: set[date] = set()
+        for d in unique_dates:
+            roi, ni = self._get(d.year)
+            if d in roi:
+                roi_set.add(d)
+            if d in ni:
+                ni_set.add(d)
+
+        dates_array = np.array([ts.date() for ts in index])
+        roi_flags = np.array([d in roi_set for d in dates_array], dtype=np.float32)
+        ni_flags = np.array([d in ni_set for d in dates_array], dtype=np.float32)
+
+        return pd.DataFrame(
+            {
+                "calendar__is_roi_holiday": roi_flags,
+                "calendar__is_ni_holiday": ni_flags,
+                "calendar__is_any_holiday": np.clip(roi_flags + ni_flags, 0, 1),
+            },
+            index=index,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -257,195 +260,196 @@ class FeatureConfig:
     """
     Controls which feature families are computed and their parameters.
 
-    All defaults are tuned for 15-minute I-SEM intervals.
+    Defaults are calibrated for 15-minute I-SEM intervals.
+    Changing any value produces a different config hash for lineage tracking.
+
+    Lag reference:
+        1   = 15 min,  2 = 30 min,   4 = 1 h,
+        8   = 2 h,    96 = 24 h,   192 = 48 h,  672 = 1 week
+    Rolling reference:
+        4   = 1 h,    16 = 4 h,     96 = 24 h
     """
 
-    # Lag windows in number of intervals
     lag_intervals: tuple[int, ...] = (1, 2, 4, 8, 96, 192, 672)
-    # Ramp windows (delta over N intervals)
     ramp_intervals: tuple[int, ...] = (1, 4, 8)
-    # Rolling statistic windows in intervals
-    rolling_windows: tuple[int, ...] = (4, 16, 96)   # ~1h, ~4h, ~24h at 15-min
-    # Enable/disable families
+    rolling_windows: tuple[int, ...] = (4, 16, 96)
+
     enable_lag: bool = True
     enable_ramp: bool = True
     enable_temporal: bool = True
     enable_rolling: bool = True
     enable_calendar: bool = True
-    # Rejection threshold: vectors with more missing features than this
-    # fraction are logged as warnings.
+
     missing_rate_warn_threshold: float = 0.3
 
+    # min_periods < window allows partial warm-up at the start of the
+    # series rather than producing a full leading NaN block.
+    rolling_min_periods: int = 1
+
+    def to_hash(self) -> str:
+        import json
+        payload = json.dumps(
+            {k: list(v) if isinstance(v, tuple) else v
+             for k, v in self.__dict__.items()},
+            sort_keys=True,
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
 
 # ---------------------------------------------------------------------------
-# Individual feature families
+# Signal column registry
 # ---------------------------------------------------------------------------
 
-def _lag_features(
-    records: list[IntervalRecord],
-    idx: int,
-    config: FeatureConfig,
-) -> dict[str, float | None]:
+# Signals used for lag and ramp features
+_LAG_RAMP_SIGNALS: dict[str, str] = {
+    "price_eur_mwh": "EUR/MWh",
+    "imbalance_mw": "MW",
+    "system_demand_mw": "MW",
+    "wind_generation_mw": "MW",
+}
+
+# Signals used for rolling statistics
+_ROLLING_SIGNALS: dict[str, str] = {
+    "price_eur_mwh": "EUR/MWh",
+    "imbalance_mw": "MW",
+    "wind_generation_mw": "MW",
+}
+
+_ALL_SIGNAL_COLUMNS: list[str] = list(_LAG_RAMP_SIGNALS.keys()) + ["temperature_celsius"]
+
+
+# ---------------------------------------------------------------------------
+# Vectorised transformation helpers
+# ---------------------------------------------------------------------------
+
+def _add_lag_features(df: pd.DataFrame, config: FeatureConfig) -> pd.DataFrame:
     """
-    For each configured lag window, return the value N intervals ago.
+    Shift each signal column by each configured lag window.
 
-    Covers price, imbalance, demand, and wind.
+    Uses pd.concat of pre-computed Series to avoid repeated DataFrame
+    copies inside a loop.
     """
-    features: dict[str, float | None] = {}
-    targets = {
-        "price_eur_mwh": lambda r: r.price_eur_mwh,
-        "imbalance_mw": lambda r: r.imbalance_mw,
-        "system_demand_mw": lambda r: r.system_demand_mw,
-        "wind_generation_mw": lambda r: r.wind_generation_mw,
-    }
-    for lag in config.lag_intervals:
-        src_idx = idx - lag
-        for col, getter in targets.items():
-            key = f"{col}__lag_{lag}"
-            features[key] = getter(records[src_idx]) if src_idx >= 0 else None
-    return features
+    parts: list[pd.Series] = []
+    for col in _LAG_RAMP_SIGNALS:
+        if col not in df.columns:
+            logger.warning("Lag: signal column %s not found — skipping.", col)
+            continue
+        for lag in config.lag_intervals:
+            parts.append(df[col].shift(lag).rename(f"{col}__lag_{lag}"))
+
+    return pd.concat([df, *parts], axis=1) if parts else df
 
 
-def _ramp_features(
-    records: list[IntervalRecord],
-    idx: int,
-    config: FeatureConfig,
-) -> dict[str, float | None]:
+def _add_ramp_features(df: pd.DataFrame, config: FeatureConfig) -> pd.DataFrame:
     """
-    Rate of change: current value minus value N intervals ago.
+    First-difference over each ramp window.
 
-    Positive ramp = rising; negative = falling.
+    pd.Series.diff(n) == series - series.shift(n), fully vectorised.
+    Positive value = rising price/imbalance, negative = falling.
     """
-    features: dict[str, float | None] = {}
-    targets = {
-        "price_eur_mwh": lambda r: r.price_eur_mwh,
-        "imbalance_mw": lambda r: r.imbalance_mw,
-    }
-    current = records[idx]
-    for window in config.ramp_intervals:
-        src_idx = idx - window
-        for col, getter in targets.items():
-            key = f"{col}__ramp_{window}"
-            if src_idx >= 0:
-                past_val = getter(records[src_idx])
-                curr_val = getter(current)
-                features[key] = (
-                    curr_val - past_val
-                    if curr_val is not None and past_val is not None
-                    else None
-                )
-            else:
-                features[key] = None
-    return features
+    parts: list[pd.Series] = []
+    for col in ("price_eur_mwh", "imbalance_mw"):
+        if col not in df.columns:
+            logger.warning("Ramp: signal column %s not found — skipping.", col)
+            continue
+        for window in config.ramp_intervals:
+            parts.append(df[col].diff(window).rename(f"{col}__ramp_{window}"))
+
+    return pd.concat([df, *parts], axis=1) if parts else df
 
 
-def _temporal_features(ts: datetime) -> dict[str, float | None]:
+def _add_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Cyclical encoding of time-of-day, day-of-week, and month.
+    Cyclical sin/cos encoding for time-of-day, day-of-week, and month.
 
-    Raw integers (hour=14) are poor model inputs because hour 23 and hour 0
-    are adjacent in time but far apart numerically.  Sin/cos encoding
-    preserves cyclical continuity.
+    Sin/cos encoding preserves cyclical adjacency that raw integers cannot:
+    interval 95 (23:45) and interval 0 (00:00) are correctly identified
+    as neighbours.  Raw integers are also retained for tree-based models
+    that can exploit ordinality directly.
     """
-    local = ts  # Caller is responsible for tz conversion if needed.
-    interval_of_day = ts.hour * 4 + ts.minute // 15  # 0..95 for 15-min grid
-    dow = ts.weekday()  # 0=Monday
-    month = ts.month
+    idx = df.index
 
-    def encode(value: float, period: float) -> tuple[float, float]:
-        angle = 2 * math.pi * value / period
-        return math.sin(angle), math.cos(angle)
+    interval_of_day = (idx.hour * 4 + idx.minute // 15).astype(np.float32)
+    dow = idx.dayofweek.astype(np.float32)
+    month = idx.month.astype(np.float32)
 
-    tod_sin, tod_cos = encode(interval_of_day, 96)
-    dow_sin, dow_cos = encode(dow, 7)
-    month_sin, month_cos = encode(month - 1, 12)
+    def encode(
+        values: np.ndarray, period: float
+    ) -> tuple[np.ndarray, np.ndarray]:
+        angle = 2.0 * np.pi * values / period
+        return np.sin(angle).astype(np.float32), np.cos(angle).astype(np.float32)
 
-    return {
-        "temporal__interval_of_day": float(interval_of_day),
-        "temporal__tod_sin": tod_sin,
-        "temporal__tod_cos": tod_cos,
-        "temporal__dow": float(dow),
-        "temporal__dow_sin": dow_sin,
-        "temporal__dow_cos": dow_cos,
-        "temporal__month_sin": month_sin,
-        "temporal__month_cos": month_cos,
-        "temporal__is_weekend": float(dow >= 5),
-    }
+    tod_sin, tod_cos = encode(interval_of_day, 96.0)
+    dow_sin, dow_cos = encode(dow, 7.0)
+    month_sin, month_cos = encode(month - 1.0, 12.0)
+
+    temporal = pd.DataFrame(
+        {
+            "temporal__interval_of_day": interval_of_day,
+            "temporal__tod_sin": tod_sin,
+            "temporal__tod_cos": tod_cos,
+            "temporal__dow": dow,
+            "temporal__dow_sin": dow_sin,
+            "temporal__dow_cos": dow_cos,
+            "temporal__month_sin": month_sin,
+            "temporal__month_cos": month_cos,
+            "temporal__is_weekend": (dow >= 5.0).astype(np.float32),
+        },
+        index=idx,
+    )
+    return pd.concat([df, temporal], axis=1)
 
 
-def _rolling_features(
-    records: list[IntervalRecord],
-    idx: int,
-    config: FeatureConfig,
-) -> dict[str, float | None]:
+def _add_rolling_features(df: pd.DataFrame, config: FeatureConfig) -> pd.DataFrame:
     """
-    Rolling mean and standard deviation over configured windows.
+    Rolling mean and population std over configured windows.
 
-    Window is left-closed [idx-window+1 .. idx] inclusive.
-    Returns None if the window cannot be fully populated.
+    ddof=0 (population std) is used for consistency at small window sizes
+    where sample std would be undefined or noisy.
+
+    min_periods=config.rolling_min_periods allows partial warm-up at the
+    start of the series; set to `window` in config for strict behaviour.
     """
-    features: dict[str, float | None] = {}
-    targets = {
-        "price_eur_mwh": lambda r: r.price_eur_mwh,
-        "imbalance_mw": lambda r: r.imbalance_mw,
-        "wind_generation_mw": lambda r: r.wind_generation_mw,
-    }
-    for window in config.rolling_windows:
-        start = idx - window + 1
-        slice_ = records[max(0, start): idx + 1] if start >= 0 else []
-        for col, getter in targets.items():
-            vals = [getter(r) for r in slice_ if getter(r) is not None]
-            if len(vals) < window:
-                features[f"{col}__roll_mean_{window}"] = None
-                features[f"{col}__roll_std_{window}"] = None
-            else:
-                mean = sum(vals) / len(vals)
-                variance = sum((v - mean) ** 2 for v in vals) / len(vals)
-                features[f"{col}__roll_mean_{window}"] = mean
-                features[f"{col}__roll_std_{window}"] = math.sqrt(variance)
-    return features
+    parts: list[pd.Series] = []
+    for col in _ROLLING_SIGNALS:
+        if col not in df.columns:
+            logger.warning("Rolling: signal column %s not found — skipping.", col)
+            continue
+        for window in config.rolling_windows:
+            roller = df[col].rolling(
+                window=window,
+                min_periods=config.rolling_min_periods,
+            )
+            parts.append(roller.mean().rename(f"{col}__roll_mean_{window}"))
+            parts.append(roller.std(ddof=0).rename(f"{col}__roll_std_{window}"))
+
+    return pd.concat([df, *parts], axis=1) if parts else df
 
 
-def _calendar_features(
-    ts: datetime,
+def _add_calendar_features(
+    df: pd.DataFrame,
     calendar: AllIslandCalendar,
-) -> dict[str, float | None]:
-    """
-    Binary flags for ROI holiday, NI holiday, and combined.
-
-    Kept as separate flags so a participant in NI and one in ROI
-    can both be served from the same feature set.
-    """
-    d = ts.date()
-    return {
-        "calendar__is_roi_holiday": float(calendar.is_roi_holiday(d)),
-        "calendar__is_ni_holiday": float(calendar.is_ni_holiday(d)),
-        "calendar__is_any_holiday": float(calendar.is_any_holiday(d)),
-    }
+) -> pd.DataFrame:
+    holiday_df = calendar.build_holiday_frame(df.index)
+    return pd.concat([df, holiday_df], axis=1)
 
 
 # ---------------------------------------------------------------------------
 # Manifest builder
 # ---------------------------------------------------------------------------
 
-def _build_manifest(config: FeatureConfig) -> list[FeatureManifest]:
+def build_manifest(config: FeatureConfig) -> list[FeatureManifest]:
     """
-    Produce the full feature manifest matching the configured feature set.
+    Produce the full feature manifest from config alone.
 
-    The manifest is generated from config, not from actual data, so it
-    is available before any records are processed.
+    Available before any data is processed; used for schema validation
+    and dataset lineage tracking downstream.
     """
     manifests: list[FeatureManifest] = []
-    signal_units = {
-        "price_eur_mwh": "EUR/MWh",
-        "imbalance_mw": "MW",
-        "system_demand_mw": "MW",
-        "wind_generation_mw": "MW",
-    }
 
     if config.enable_lag:
-        for lag in config.lag_intervals:
-            for col, unit in signal_units.items():
+        for col, unit in _LAG_RAMP_SIGNALS.items():
+            for lag in config.lag_intervals:
                 manifests.append(FeatureManifest(
                     feature_name=f"{col}__lag_{lag}",
                     family=FeatureFamily.LAG,
@@ -454,13 +458,13 @@ def _build_manifest(config: FeatureConfig) -> list[FeatureManifest]:
                 ))
 
     if config.enable_ramp:
-        for window in config.ramp_intervals:
-            for col in ("price_eur_mwh", "imbalance_mw"):
+        for col in ("price_eur_mwh", "imbalance_mw"):
+            for window in config.ramp_intervals:
                 manifests.append(FeatureManifest(
                     feature_name=f"{col}__ramp_{window}",
                     family=FeatureFamily.RAMP,
                     description=f"Change in {col} over {window} intervals",
-                    unit=signal_units[col],
+                    unit=_LAG_RAMP_SIGNALS[col],
                 ))
 
     if config.enable_temporal:
@@ -483,12 +487,8 @@ def _build_manifest(config: FeatureConfig) -> list[FeatureManifest]:
             ))
 
     if config.enable_rolling:
-        for window in config.rolling_windows:
-            for col, unit in {
-                "price_eur_mwh": "EUR/MWh",
-                "imbalance_mw": "MW",
-                "wind_generation_mw": "MW",
-            }.items():
+        for col, unit in _ROLLING_SIGNALS.items():
+            for window in config.rolling_windows:
                 manifests.append(FeatureManifest(
                     feature_name=f"{col}__roll_mean_{window}",
                     family=FeatureFamily.ROLLING,
@@ -519,6 +519,76 @@ def _build_manifest(config: FeatureConfig) -> list[FeatureManifest]:
 
 
 # ---------------------------------------------------------------------------
+# Records <-> DataFrame I/O
+# ---------------------------------------------------------------------------
+
+def _records_to_df(records: list[IntervalRecord]) -> pd.DataFrame:
+    """
+    Convert IntervalRecord list to a UTC-indexed float64 DataFrame.
+
+    None values become NaN naturally via pandas construction.
+    """
+    rows = {
+        col: [getattr(r, col) for r in records]
+        for col in _ALL_SIGNAL_COLUMNS
+    }
+    index = pd.DatetimeIndex(
+        [r.timestamp_utc for r in records],
+        name="timestamp_utc",
+    )
+    df = pd.DataFrame(rows, index=index, dtype=np.float64)
+
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    else:
+        df.index = df.index.tz_convert("UTC")
+
+    return df
+
+
+def _df_to_vectors(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    warn_threshold: float,
+) -> list[FeatureVector]:
+    """
+    Convert the engineered DataFrame back to FeatureVector domain objects.
+
+    NaN values become None to preserve the domain contract that None
+    means missing, not zero.
+    """
+    feature_df = df[feature_cols]
+    n_features = len(feature_cols)
+    vectors: list[FeatureVector] = []
+
+    # Convert to records as dicts for fast row iteration.
+    for ts, row in zip(feature_df.index, feature_df.to_dict(orient="records")):
+        features: dict[str, float | None] = {
+            col: (None if pd.isna(val) else float(val))
+            for col, val in row.items()
+        }
+        missing = sum(1 for v in features.values() if v is None)
+
+        if missing / max(n_features, 1) > warn_threshold:
+            logger.warning(
+                "High missing rate at %s: %d/%d features absent.",
+                ts.isoformat(),
+                missing,
+                n_features,
+            )
+
+        vectors.append(
+            FeatureVector(
+                timestamp_utc=ts.to_pydatetime(),
+                features=features,
+                missing_count=missing,
+            )
+        )
+
+    return vectors
+
+
+# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
@@ -527,16 +597,22 @@ class FeatureEngineeringPipeline:
     """
     Transforms a sequence of IntervalRecords into a FeatureFrame.
 
-    Records must be sorted in ascending timestamp order.  Gaps in the
-    series are tolerated: missing values propagate as None rather than
-    causing failure, and are surfaced via FeatureVector.missing_count.
+    Records must be sorted in ascending timestamp order and should use a
+    consistent cadence. Gaps are tolerated but affect rolling and lag
+    features for the intervals immediately following the gap.
+
+    Internally all numerical operations use pandas/numpy.  The public
+    API accepts and returns typed domain objects so the pandas dependency
+    stays an implementation detail of this module.
 
     Usage::
 
         pipeline = FeatureEngineeringPipeline(config=FeatureConfig())
         frame = pipeline.run(records)
+
         # frame.vectors  — one FeatureVector per input record
-        # frame.manifest — full feature definition list
+        # frame.manifest — full reproducible feature definition list
+        # frame.overall_missing_rate — data quality summary
     """
 
     config: FeatureConfig = field(default_factory=FeatureConfig)
@@ -547,52 +623,50 @@ class FeatureEngineeringPipeline:
         Engineer features for every interval in the input sequence.
 
         Args:
-            records: Normalised market intervals, ascending timestamp order.
+            records: Normalised market intervals in strictly ascending
+                     UTC timestamp order.
 
         Returns:
-            FeatureFrame containing one FeatureVector per record.
+            FeatureFrame with one FeatureVector per input record.
 
         Raises:
-            ValueError: if records are empty or not sorted.
+            ValueError:  if records are empty or not strictly sorted.
+            RuntimeError: if the pipeline produces incomplete output
+                          (indicates a config/code mismatch).
         """
         records = list(records)
         self._validate_inputs(records)
 
-        manifest = _build_manifest(self.config)
-        vectors: list[FeatureVector] = []
+        manifest = build_manifest(self.config)
+        feature_cols = [m.feature_name for m in manifest]
 
-        for idx, record in enumerate(records):
-            features: dict[str, float | None] = {}
+        df = _records_to_df(records)
 
-            if self.config.enable_lag:
-                features.update(_lag_features(records, idx, self.config))
+        if self.config.enable_lag:
+            df = _add_lag_features(df, self.config)
 
-            if self.config.enable_ramp:
-                features.update(_ramp_features(records, idx, self.config))
+        if self.config.enable_ramp:
+            df = _add_ramp_features(df, self.config)
 
-            if self.config.enable_temporal:
-                features.update(_temporal_features(record.timestamp_utc))
+        if self.config.enable_temporal:
+            df = _add_temporal_features(df)
 
-            if self.config.enable_rolling:
-                features.update(_rolling_features(records, idx, self.config))
+        if self.config.enable_rolling:
+            df = _add_rolling_features(df, self.config)
 
-            if self.config.enable_calendar:
-                features.update(_calendar_features(record.timestamp_utc, self.calendar))
+        if self.config.enable_calendar:
+            df = _add_calendar_features(df, self.calendar)
 
-            vector = FeatureVector(
-                timestamp_utc=record.timestamp_utc,
-                features=features,
+        missing_cols = set(feature_cols) - set(df.columns)
+        if missing_cols:
+            raise RuntimeError(
+                f"Feature engineering produced incomplete output. "
+                f"Missing columns: {sorted(missing_cols)}"
             )
 
-            if vector.missing_count / max(len(features), 1) > self.config.missing_rate_warn_threshold:
-                logger.warning(
-                    "High missing rate at %s: %d/%d features absent.",
-                    record.timestamp_utc.isoformat(),
-                    vector.missing_count,
-                    len(features),
-                )
-
-            vectors.append(vector)
+        vectors = _df_to_vectors(
+            df, feature_cols, self.config.missing_rate_warn_threshold
+        )
 
         frame = FeatureFrame(vectors=vectors, manifest=manifest)
 
@@ -613,7 +687,7 @@ class FeatureEngineeringPipeline:
         for i in range(1, len(records)):
             if records[i].timestamp_utc <= records[i - 1].timestamp_utc:
                 raise ValueError(
-                    f"Records must be in ascending timestamp order. "
-                    f"Found {records[i].timestamp_utc!r} after "
-                    f"{records[i - 1].timestamp_utc!r} at index {i}."
+                    f"Records must be in strictly ascending timestamp order. "
+                    f"Found {records[i].timestamp_utc!r} at index {i} after "
+                    f"{records[i - 1].timestamp_utc!r}."
                 )

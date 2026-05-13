@@ -14,7 +14,6 @@ This is a **new project from scratch**. The old repository is reference material
 
 ## What We Learned From the Old Project
 
-The previous project (`balancing-mechanism-master`) is useful for patterns, but not market semantics.
 
 ### Reusable Patterns
 - Forecaster loop and scheduling pattern (`app/forecaster.py`)
@@ -23,12 +22,6 @@ The previous project (`balancing-mechanism-master`) is useful for patterns, but 
 - Unit test style and edge-case coverage (`tests/*`)
 - Simple baseline model concept (`forecast_models/previous_day_model.py`)
 
-### Must Be Replaced
-- Tariff-based logic (`import_tariff`, `ppa_tariff`) as primary market model
-- Hardcoded assumptions like `export_price = 0`
-- UK-only holiday/country mappings
-- Hardcoded 30-minute cadence where not aligned to new target
-- Old response contract if it lacks imbalance/spike/dispatch outputs
 
 ---
 
@@ -45,7 +38,7 @@ From the quick guide and discussion:
 
 ---
 
-## New Project Architecture (agreed direction)
+## New Project Architecture
 
 ```text
 energy-decision-engine/
